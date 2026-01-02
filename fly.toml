@@ -1,0 +1,31 @@
+# fly.toml app configuration file generated for openpic-worker on 2025-11-22T20:02:48Z
+#
+# See https://fly.io/docs/reference/configuration/ for information about how to use this file.
+#
+
+app = 'openpic-worker'
+primary_region = 'bom'
+
+[experimental]
+  auto_rollback = true
+
+[build]
+  dockerfile = 'Dockerfile'
+
+[env]
+  PYTHONUNBUFFERED = '1'
+
+[[mounts]]
+  source = 'model_cache'
+  destination = '/data'
+
+[[services]]
+  protocol = 'tcp'
+  internal_port = 8080
+  ports = []
+  processes = ['app']
+
+[[vm]]
+  memory = '4gb'
+  cpu_kind = 'performance'
+  cpus = 2
