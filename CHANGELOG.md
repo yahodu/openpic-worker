@@ -25,6 +25,10 @@ written for whoever operates the pipeline, not for whoever wrote the diff.
 
 - Repository documentation set: `LICENSE`, `CONTRIBUTING.md`, `AGENTS.md`,
   `CODE_OF_CONDUCT.md`, `SECURITY.md`, `SUPPORT.md`, the ADR ledger and template.
+- Platform design set under `docs/`: the normative `API Contract.md` and
+  `CONVENTIONS.md` that `AGENTS.md` and `CONTRIBUTING.md` cite, plus `Diagrams.md`,
+  `Notification and Database Design.md`, `Thumbnail Generation and Cache flow.md`
+  and `Upload flow.md`.
 
 ### Changed
 
