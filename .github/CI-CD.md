@@ -48,7 +48,10 @@ apply to docs, workflows and config as well as to Python.
   anything else. Re-enable default setup only if you delete `codeql.yml`;
   running both duplicates every alert.
 - **Dependabot security updates** are enabled; `dependabot.yml` adds the
-  version-update PRs on top.
+  version-update PRs on top. Its `pip` and `docker` blocks are commented out
+  because an ecosystem with no manifest is a *scheduled error* on the
+  Dependabot page, not a no-op. Uncomment them when `pyproject.toml` and the
+  `Dockerfile` land — Dependabot will not add them back by itself.
 
 
 ## GitHub-hosted runners have no GPU
