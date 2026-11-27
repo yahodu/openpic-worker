@@ -96,8 +96,7 @@ run at least once:
 ```
 CI / Lint & format
 CI / Type check
-CI / Tests (py3.12)
-CI / Tests (py3.13)
+CI / Tests
 CI / Dependency audit (runtime)
 CI / Secret scan (gitleaks)
 PR Checks / Branch name
