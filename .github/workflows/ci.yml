@@ -108,29 +108,28 @@ jobs:
         run: uv run --frozen mypy .
 
   test:
-    name: Tests (py${{ matrix.python }})
+    name: Tests
     needs: project
     if: needs.project.outputs.python == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 20
-    strategy:
-      fail-fast: false
-      matrix:
-        # The version floor is whatever the GPU runtime image ships; 3.12 is
-        # the current sweet spot across Modal and vast.ai base images.
-        # NB: the key is `python`, not `python-version` — a hyphen makes the
-        # `matrix.python-version` expression invalid and it renders literally.
-        python: ["3.12", "3.13"]
+    # Single interpreter on purpose. `jobs.<job_id>.name` does NOT interpolate
+    # the matrix context (a matrix name renders literally as `${{ matrix.x }}`,
+    # which also makes the required-check name unusable), so a matrix here would
+    # produce two identical, indistinguishable check-runs. Pin the version the
+    # GPU images ship — 3.12 is the common floor across Modal and vast.ai base
+    # images — and add a second job with an explicit name if a second version
+    # ever needs testing.
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           persist-credentials: false
 
-      - name: Setup uv (with Python ${{ matrix.python }})
+      - name: Setup uv (Python 3.12)
         uses: astral-sh/setup-uv@1db35dd8eee11c5894872e0b383ae6c406cf738d # v10.4.0
         with:
-          python-version: ${{ matrix.python }}
+          python-version: "3.12"
           enable-cache: true
           cache-dependency-glob: uv.lock
 
