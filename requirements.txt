@@ -4,5 +4,5 @@ pymongo==4.18.3
 insightface==0.7.3
 onnxruntime==1.23.2
 numpy==1.24.3
-Pillow==10.0.0
+Pillow==13.0.0
 requests==2.33.0
