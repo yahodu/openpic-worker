@@ -201,15 +201,22 @@ jobs:
   # Runs even before the Python project exists: workflows and docs can leak
   # secrets too, and this scans full history, not just the diff.
   #
-  # The gitleaks *action* is deliberately not used: `yahodu` is a GitHub
-  # organisation, and gitleaks-action refuses to run for organisations without
-  # a paid GITLEAKS_LICENSE. The CLI is the same engine, open source, pinned to
-  # an exact version and verified against its published SHA-256 — which is also
-  # a stronger supply-chain guarantee than a tag pointing at a container image.
+  # `gitleaks-action` is used because the organisation licence (GITLEAKS_LICENSE)
+  # is now provisioned — it refuses to run for organisation-owned repos without
+  # one. What the action buys over the CLI it replaced: inline PR review
+  # comments on the offending line, a job summary, and a SARIF artifact. The
+  # engine version is still pinned explicitly via GITLEAKS_VERSION (no `v`
+  # prefix), so this is not a floating dependency.
+  #
+  # `pull-requests: write` is scoped to this job only and exists solely so the
+  # action can post that comment; the workflow ceiling stays `contents: read`.
   secret-scan:
     name: Secret scan (gitleaks)
     runs-on: ubuntu-latest
     timeout-minutes: 10
+    permissions:
+      contents: read
+      pull-requests: write
     steps:
       - name: Checkout (full history)
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
@@ -217,35 +224,13 @@ jobs:
           fetch-depth: 0
           persist-credentials: false
 
-      - name: Install gitleaks
+      - name: gitleaks
+        uses: gitleaks/gitleaks-action@e0c47f4f8be36e29cdc102c57e68cb5cbf0e8d1e # v3
         env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITLEAKS_LICENSE: ${{ secrets.GITLEAKS_LICENSE }}
+          # Pin the engine, not just the action: "latest" is what the action
+          # defaults to for the binary it downloads.
           GITLEAKS_VERSION: "8.30.1"
-          # sha256 of gitleaks_8.30.1_linux_x64.tar.gz, from the release metadata.
-          GITLEAKS_SHA256: "551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb"
-        run: |
-          set -euo pipefail
-          archive="$RUNNER_TEMP/gitleaks.tgz"
-          curl -sSfL \
-            "https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz" \
-            -o "$archive"
-          echo "${GITLEAKS_SHA256}  ${archive}" | sha256sum -c -
-          tar -xzf "$archive" -C "$RUNNER_TEMP" gitleaks
-          "$RUNNER_TEMP/gitleaks" version
-          echo "$RUNNER_TEMP" >> "$GITHUB_PATH"
-
-      - name: Scan for secrets
-        env:
-          EVENT: ${{ github.event_name }}
-          BASE_REF: ${{ github.base_ref }}
-        run: |
-          set -euo pipefail
-
-          if [ "$EVENT" = "pull_request" ]; then
-            # Only the commits this PR introduces; findings in untouched
-            # history belong to whoever merged them, not to this author.
-            git fetch --no-tags origin "$BASE_REF"
-            gitleaks git . --log-opts="origin/${BASE_REF}..HEAD" --redact --no-banner --exit-code 1
-          else
-            # Push to main: the whole history, every time.
-            gitleaks git . --redact --no-banner --exit-code 1
-          fi
+          GITLEAKS_ENABLE_COMMENTS: "true"
+          GITLEAKS_ENABLE_SUMMARY: "true"
