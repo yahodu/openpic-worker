@@ -35,6 +35,21 @@ apply to docs, workflows and config as well as to Python.
   fail_under`, so the policy is next to the code rather than in YAML.
 - **pip-audit** for advisories, split into a blocking runtime audit and a
   non-blocking dev-toolchain audit.
+- **gitleaks CLI**, installed from a pinned release and verified against its
+  published SHA-256. The `gitleaks-action` is not used: it refuses to run for
+  organisation-owned repositories without a paid licence, and pinning the
+  binary by digest is the stronger guarantee anyway.
+
+## Two settings that live outside the repo
+
+- **CodeQL default setup is disabled** on this repository. It was enabled
+  before these workflows existed, ran a second, untunable analysis, and
+  failed on the empty tree. `codeql.yml` replaces it and is reviewable like
+  anything else. Re-enable default setup only if you delete `codeql.yml`;
+  running both duplicates every alert.
+- **Dependabot security updates** are enabled; `dependabot.yml` adds the
+  version-update PRs on top.
+
 
 ## GitHub-hosted runners have no GPU
 

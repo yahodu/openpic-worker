@@ -108,7 +108,7 @@ jobs:
         run: uv run --frozen mypy .
 
   test:
-    name: Tests (py${{ matrix.python-version }})
+    name: Tests (py${{ matrix.python }})
     needs: project
     if: needs.project.outputs.python == 'true'
     runs-on: ubuntu-latest
@@ -118,17 +118,19 @@ jobs:
       matrix:
         # The version floor is whatever the GPU runtime image ships; 3.12 is
         # the current sweet spot across Modal and vast.ai base images.
-        python-version: ["3.12", "3.13"]
+        # NB: the key is `python`, not `python-version` — a hyphen makes the
+        # `matrix.python-version` expression invalid and it renders literally.
+        python: ["3.12", "3.13"]
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           persist-credentials: false
 
-      - name: Setup uv (with Python ${{ matrix.python-version }})
+      - name: Setup uv (with Python ${{ matrix.python }})
         uses: astral-sh/setup-uv@1db35dd8eee11c5894872e0b383ae6c406cf738d # v10.4.0
         with:
-          python-version: ${{ matrix.python-version }}
+          python-version: ${{ matrix.python }}
           enable-cache: true
           cache-dependency-glob: uv.lock
 
@@ -199,6 +201,12 @@ jobs:
 
   # Runs even before the Python project exists: workflows and docs can leak
   # secrets too, and this scans full history, not just the diff.
+  #
+  # The gitleaks *action* is deliberately not used: `yahodu` is a GitHub
+  # organisation, and gitleaks-action refuses to run for organisations without
+  # a paid GITLEAKS_LICENSE. The CLI is the same engine, open source, pinned to
+  # an exact version and verified against its published SHA-256 — which is also
+  # a stronger supply-chain guarantee than a tag pointing at a container image.
   secret-scan:
     name: Secret scan (gitleaks)
     runs-on: ubuntu-latest
@@ -210,9 +218,35 @@ jobs:
           fetch-depth: 0
           persist-credentials: false
 
-      - name: gitleaks
-        uses: gitleaks/gitleaks-action@e0c47f4f8be36e29cdc102c57e68cb5cbf0e8d1e # v3
+      - name: Install gitleaks
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          # Only required for organisation-owned repos; harmless when unset.
-          GITLEAKS_LICENSE: ${{ secrets.GITLEAKS_LICENSE }}
+          GITLEAKS_VERSION: "8.30.1"
+          # sha256 of gitleaks_8.30.1_linux_x64.tar.gz, from the release metadata.
+          GITLEAKS_SHA256: "551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb"
+        run: |
+          set -euo pipefail
+          archive="$RUNNER_TEMP/gitleaks.tgz"
+          curl -sSfL \
+            "https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz" \
+            -o "$archive"
+          echo "${GITLEAKS_SHA256}  ${archive}" | sha256sum -c -
+          tar -xzf "$archive" -C "$RUNNER_TEMP" gitleaks
+          "$RUNNER_TEMP/gitleaks" version
+          echo "$RUNNER_TEMP" >> "$GITHUB_PATH"
+
+      - name: Scan for secrets
+        env:
+          EVENT: ${{ github.event_name }}
+          BASE_REF: ${{ github.base_ref }}
+        run: |
+          set -euo pipefail
+
+          if [ "$EVENT" = "pull_request" ]; then
+            # Only the commits this PR introduces; findings in untouched
+            # history belong to whoever merged them, not to this author.
+            git fetch --no-tags origin "$BASE_REF"
+            gitleaks git . --log-opts="origin/${BASE_REF}..HEAD" --redact --no-banner --exit-code 1
+          else
+            # Push to main: the whole history, every time.
+            gitleaks git . --redact --no-banner --exit-code 1
+          fi
