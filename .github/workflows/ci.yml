@@ -1,0 +1,218 @@
+# CI — the functional merge gate for this repository.
+#
+# Repo-specific design notes
+# --------------------------
+# 1. GitHub-hosted runners have NO GPU. Every test that runs here must be
+#    CPU-capable and exercise the device layer through a mock/fake backend.
+#    Anything that genuinely needs CUDA belongs in the manual GPU workflow
+#    described in .github/CI-CD.md, not in this gate.
+# 2. The repo is mid-rewrite: `pyproject.toml` does not exist yet. The
+#    `project` job detects that and every Python job skips, so `main` is not
+#    permanently red while the worker is being rewritten. The gates switch
+#    themselves on the moment a `pyproject.toml` lands; at that point the
+#    `needs: project` conditions can be deleted (they become dead weight).
+# 3. Jobs are independent (no `needs:` chains beyond the detector) so a
+#    dependency advisory cannot mask a genuine test regression, matching the
+#    separation-of-concerns rule the web app repo settled on.
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+# Least privilege: read-only by default, no secrets, nothing to exfiltrate.
+permissions:
+  contents: read
+
+# A new push to a PR supersedes the previous run; a push to main never cancels
+# another main run (those carry the deploy evidence).
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  project:
+    name: Detect project layout
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    outputs:
+      python: ${{ steps.probe.outputs.python }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+
+      - name: Probe for a Python project
+        id: probe
+        run: |
+          if [ -f pyproject.toml ]; then
+            echo "python=true" >> "$GITHUB_OUTPUT"
+            echo "Python project detected — Python jobs are enabled."
+          else
+            echo "python=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::No pyproject.toml found. This repository is awaiting the worker reimplementation, so lint/type/test/audit skip. Push a pyproject.toml (with uv.lock) to activate them."
+          fi
+
+  lint:
+    name: Lint & format
+    needs: project
+    if: needs.project.outputs.python == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+
+      - name: Setup uv
+        uses: astral-sh/setup-uv@1db35dd8eee11c5894872e0b383ae6c406cf738d # v10.4.0
+        with:
+          enable-cache: true
+          cache-dependency-glob: uv.lock
+
+      # --frozen: resolve strictly from uv.lock, never silently re-lock in CI.
+      - name: Sync environment
+        run: uv sync --frozen
+
+      - name: Ruff check
+        run: uv run --frozen ruff check --output-format=github .
+
+      - name: Ruff format check
+        run: uv run --frozen ruff format --check --diff .
+
+  typecheck:
+    name: Type check
+    needs: project
+    if: needs.project.outputs.python == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+
+      - name: Setup uv
+        uses: astral-sh/setup-uv@1db35dd8eee11c5894872e0b383ae6c406cf738d # v10.4.0
+        with:
+          enable-cache: true
+          cache-dependency-glob: uv.lock
+
+      - name: Sync environment
+        run: uv sync --frozen
+
+      - name: mypy
+        run: uv run --frozen mypy .
+
+  test:
+    name: Tests (py${{ matrix.python-version }})
+    needs: project
+    if: needs.project.outputs.python == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        # The version floor is whatever the GPU runtime image ships; 3.12 is
+        # the current sweet spot across Modal and vast.ai base images.
+        python-version: ["3.12", "3.13"]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+
+      - name: Setup uv (with Python ${{ matrix.python-version }})
+        uses: astral-sh/setup-uv@1db35dd8eee11c5894872e0b383ae6c406cf738d # v10.4.0
+        with:
+          python-version: ${{ matrix.python-version }}
+          enable-cache: true
+          cache-dependency-glob: uv.lock
+
+      - name: Sync environment
+        run: uv sync --frozen
+
+      # The coverage floor is owned by the project: `fail_under` in
+      # [tool.coverage.report] makes this step fail below the threshold, so the
+      # policy lives next to the code instead of being duplicated here.
+      - name: Run tests
+        run: uv run --frozen pytest -q --cov --cov-report=term-missing
+
+  # Blocking on purpose: a moderate+ advisory in a dependency that actually
+  # ships to the GPU hosts is a supply-chain incident, not a chore.
+  audit:
+    name: Dependency audit (runtime)
+    needs: project
+    if: needs.project.outputs.python == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+
+      - name: Setup uv
+        uses: astral-sh/setup-uv@1db35dd8eee11c5894872e0b383ae6c406cf738d # v10.4.0
+        with:
+          enable-cache: true
+          cache-dependency-glob: uv.lock
+
+      - name: Export runtime requirements
+        run: uv export --frozen --no-dev --no-emit-project --format requirements-txt -o "$RUNNER_TEMP/requirements.txt"
+
+      - name: pip-audit
+        run: uvx pip-audit -r "$RUNNER_TEMP/requirements.txt" --desc
+
+  # Non-blocking on purpose. A dev-only advisory with no upstream fix used to
+  # redden the whole lane in the web app repo and hide real regressions. The
+  # `|| true` is deliberate: a non-zero exit here would still publish a failed
+  # check-run even with `continue-on-error`, and that check-run is what a PR
+  # gate consumes. pip-audit prints its report before exiting non-zero, so the
+  # findings stay visible in this job's log.
+  audit-dev:
+    name: Dependency audit (dev toolchain, non-blocking)
+    needs: project
+    if: needs.project.outputs.python == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+
+      - name: Setup uv
+        uses: astral-sh/setup-uv@1db35dd8eee11c5894872e0b383ae6c406cf738d # v10.4.0
+        with:
+          enable-cache: true
+          cache-dependency-glob: uv.lock
+
+      - name: Export full requirements
+        run: uv export --frozen --no-emit-project --format requirements-txt -o "$RUNNER_TEMP/requirements-all.txt"
+
+      - name: pip-audit (dev + runtime, non-blocking)
+        run: uvx pip-audit -r "$RUNNER_TEMP/requirements-all.txt" --desc || true
+
+  # Runs even before the Python project exists: workflows and docs can leak
+  # secrets too, and this scans full history, not just the diff.
+  secret-scan:
+    name: Secret scan (gitleaks)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout (full history)
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: gitleaks
+        uses: gitleaks/gitleaks-action@e0c47f4f8be36e29cdc102c57e68cb5cbf0e8d1e # v3
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # Only required for organisation-owned repos; harmless when unset.
+          GITLEAKS_LICENSE: ${{ secrets.GITLEAKS_LICENSE }}

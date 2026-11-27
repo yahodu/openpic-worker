@@ -1,0 +1,67 @@
+# Dependabot — keeps the three dependency surfaces of this repo moving.
+#
+# PR titles come out as `build(deps): bump ...`, matching the conventional
+# prefix the PR Checks workflow requires, and `pr-checks.yml` exempts
+# `dependabot[bot]` from the branch-name and ticket rules.
+version: 2
+updates:
+  # Python runtime + dev dependencies (uv lockfile lives at the repo root).
+  - package-ecosystem: "pip"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+      time: "05:00"
+      timezone: "Etc/UTC"
+    open-pull-requests-limit: 5
+    labels:
+      - "dependencies"
+      - "python"
+    commit-message:
+      prefix: "build(deps)"
+      include: "scope"
+    groups:
+      # Patch/minor bumps arrive as one PR to keep the review queue short;
+      # majors stay individual because each one needs a real read.
+      python-minor-patch:
+        patterns: ["*"]
+        update-types: ["minor", "patch"]
+    ignore:
+      # CUDA-linked wheels must match the host driver, so a bot-chosen torch
+      # version is a broken GPU host waiting to happen. Bump these deliberately.
+      - dependency-name: "torch"
+        update-types: ["version-update:semver-major", "version-update:semver-minor"]
+      - dependency-name: "nvidia-*"
+
+  # The workflow files themselves hold production credentials.
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+      time: "05:00"
+      timezone: "Etc/UTC"
+    labels:
+      - "dependencies"
+      - "ci"
+    commit-message:
+      prefix: "ci(deps)"
+      include: "scope"
+    groups:
+      actions:
+        patterns: ["*"]
+
+  # Base image bumps (CUDA runtime, python-slim, etc.).
+  - package-ecosystem: "docker"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+      time: "05:00"
+      timezone: "Etc/UTC"
+    labels:
+      - "dependencies"
+      - "docker"
+    commit-message:
+      prefix: "build(deps)"
+      include: "scope"

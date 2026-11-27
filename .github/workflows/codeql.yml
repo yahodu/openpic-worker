@@ -1,0 +1,81 @@
+# CodeQL — static analysis for the worker's Python surface.
+#
+# Public repository, so CodeQL is free and results land in the Security tab.
+# Python needs no compilation, so `build-mode` is left at the default (none)
+# and no build step is required — which matters because this code cannot be
+# fully imported without CUDA libs present.
+name: CodeQL
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  schedule:
+    # Weekly, so newly published queries catch code that has not changed.
+    - cron: "17 4 * * 1"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: codeql-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  project:
+    name: Detect project layout
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    outputs:
+      python: ${{ steps.probe.outputs.python }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+
+      - name: Probe for Python sources
+        id: probe
+        run: |
+          # CodeQL errors out on a tree with nothing to analyse, so it stays
+          # dormant until there is a package to scan.
+          if [ -f pyproject.toml ] && find . -name '*.py' -not -path './.git/*' -print -quit | grep -q .; then
+            echo "python=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "python=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::No Python sources yet — CodeQL analysis skipped."
+          fi
+
+  analyze:
+    name: Analyze (python)
+    needs: project
+    if: needs.project.outputs.python == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      # Required to upload SARIF results to the Security tab.
+      security-events: write
+      # Only needed for private repositories / cross-repo queries.
+      packages: read
+      actions: read
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+
+      - name: Initialize CodeQL
+        uses: github/codeql-action/init@74c1aea9df7c0f02e9b7bfe4a8935abf2e5e3aa6 # v3
+        with:
+          languages: python
+          # security-and-quality is noisier than the default security suite but
+          # catches maintainability bugs (unused variables, wrong comparisons)
+          # that matter in long-running worker loops.
+          queries: security-and-quality
+
+      - name: Perform CodeQL analysis
+        uses: github/codeql-action/analyze@74c1aea9df7c0f02e9b7bfe4a8935abf2e5e3aa6 # v3
+        with:
+          category: "/language:python"

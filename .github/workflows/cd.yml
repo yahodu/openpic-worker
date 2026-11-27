@@ -1,0 +1,286 @@
+# CD — build the deployable artifact and, when enabled, roll it out.
+#
+# Shape of this pipeline and why
+# ------------------------------
+# * Artifact: a container image in GHCR. This is what a vast.ai instance pulls,
+#   so the image is the deployment unit for the self-hosted-GPU path.
+# * Modal: `modal deploy` builds and runs from the Python entrypoint (Modal's
+#   own image builder); it does not consume the GHCR image. Both paths are
+#   therefore covered, and both are gated.
+# * vast.ai provisioning is deliberately NOT automated here. Instances bill by
+#   the second and a bad filter can launch a fleet; provisioning belongs behind
+#   a human, not behind `push to main`. CI publishes the image; the control
+#   plane launches it.
+#
+# Gates before anything ships
+# ---------------------------
+# verify  -> image build/scan -> [production environment approval] -> deploy -> smoke test
+# The `production` environment should require reviewers; that approval is what
+# lets this job see MODAL_TOKEN_* at all. A PR never reaches this workflow
+# (it only triggers on main), and no secret is available to any PR-triggered
+# workflow in this repository.
+name: CD
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      deploy:
+        description: "Deploy to production after the image is published"
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+# Exactly one production roll-out at a time, and never cancel one mid-flight:
+# a half-cancelled `modal deploy` leaves the remote app in an unknown state.
+concurrency:
+  group: cd-production
+  cancel-in-progress: false
+
+env:
+  IMAGE_NAME: ghcr.io/${{ github.repository }}
+
+jobs:
+  project:
+    name: Detect project layout
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    outputs:
+      python: ${{ steps.probe.outputs.python }}
+      dockerfile: ${{ steps.probe.outputs.dockerfile }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+
+      - name: Probe
+        id: probe
+        run: |
+          if [ -f pyproject.toml ]; then
+            echo "python=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "python=false" >> "$GITHUB_OUTPUT"
+          fi
+          if [ -f Dockerfile ]; then
+            echo "dockerfile=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "dockerfile=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::No Dockerfile yet — image build skipped."
+          fi
+
+  # Re-run the functional gate here rather than trusting the PR run: a push to
+  # main is what actually ships, and merges can land without a green PR run on
+  # the exact merge commit.
+  verify:
+    name: Verify
+    needs: project
+    if: needs.project.outputs.python == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+
+      - name: Setup uv
+        uses: astral-sh/setup-uv@1db35dd8eee11c5894872e0b383ae6c406cf738d # v10.4.0
+        with:
+          enable-cache: true
+          cache-dependency-glob: uv.lock
+
+      - name: Sync environment
+        run: uv sync --frozen
+
+      - name: Lint
+        run: uv run --frozen ruff check .
+
+      - name: Tests
+        run: uv run --frozen pytest -q
+
+  build-image:
+    name: Build & publish image
+    needs: [project, verify]
+    if: needs.project.outputs.dockerfile == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    permissions:
+      contents: read
+      packages: write        # push to GHCR
+      id-token: write        # provenance attestation (OIDC)
+      attestations: write    # store the attestation
+    outputs:
+      digest: ${{ steps.build.outputs.digest }}
+      version: ${{ steps.meta.outputs.version }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+
+      - name: Log in to GHCR
+        uses: docker/login-action@8aa5831fb8d48d8f76594c7ddde61ae58019f550 # v4.8.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Derive image metadata
+        id: meta
+        uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6.2.0
+        with:
+          images: ${{ env.IMAGE_NAME }}
+          tags: |
+            type=sha,format=short
+            type=sha,format=long
+            type=raw,value=latest,enable={{is_default_branch}}
+
+      - name: Build and push
+        id: build
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: .
+          # amd64 only, on purpose: every GPU host we target (vast.ai fleet,
+          # Modal) is x86_64, and emulating a CUDA image under QEMU is slow and
+          # frequently broken. Add linux/arm64 only when a real arm64 GPU host
+          # exists to test it on.
+          platforms: linux/amd64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          # BuildKit SBOM attestation travels with the image; the provenance
+          # attestation below is generated separately so it can be verified by
+          # digest after the push.
+          sbom: true
+          provenance: false
+          # GHCR-hosted layer cache. Watch the 10 GB repository cache cap — a
+          # CUDA base image can exhaust it on its own.
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Scan image for vulnerabilities
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          scan-type: image
+          image-ref: ${{ env.IMAGE_NAME }}@${{ steps.build.outputs.digest }}
+          severity: CRITICAL,HIGH
+          # Only fail on findings that have a fix available; an unfixed base
+          # image CVE would otherwise block every build indefinitely.
+          ignore-unfixed: true
+          vuln-type: os,library
+          exit-code: "1"
+
+      - name: Attest build provenance
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-name: ${{ env.IMAGE_NAME }}
+          subject-digest: ${{ steps.build.outputs.digest }}
+          push-to-registry: true
+
+  deploy:
+    name: Deploy to production
+    needs: [project, verify, build-image]
+    # `always()` so a skipped image build (no Dockerfile yet) does not silently
+    # skip the Modal path as well; the individual results are checked explicitly.
+    if: |
+      always() &&
+      needs.verify.result == 'success' &&
+      (needs.build-image.result == 'success' || needs.build-image.result == 'skipped') &&
+      (github.event_name == 'push' || inputs.deploy) &&
+      vars.DEPLOY_ENABLED == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    # Configure in Settings -> Environments: required reviewers, plus the
+    # MODAL_TOKEN_* secrets scoped to this environment only.
+    environment:
+      name: production
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+
+      - name: Setup uv
+        uses: astral-sh/setup-uv@1db35dd8eee11c5894872e0b383ae6c406cf738d # v10.4.0
+
+      # Pinning is strongly recommended for this step specifically: it runs with
+      # production credentials in scope. Set the MODAL_CLI_VERSION repository
+      # variable; without it the newest CLI is installed on every deploy.
+      - name: Install Modal CLI
+        env:
+          MODAL_CLI_VERSION: ${{ vars.MODAL_CLI_VERSION }}
+        run: |
+          set -euo pipefail
+          if [ -n "${MODAL_CLI_VERSION:-}" ]; then
+            uv tool install "modal==${MODAL_CLI_VERSION}"
+          else
+            echo "::warning::MODAL_CLI_VERSION is unset — installing the latest Modal CLI."
+            uv tool install modal
+          fi
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+
+      - name: Deploy
+        env:
+          MODAL_TOKEN_ID: ${{ secrets.MODAL_TOKEN_ID }}
+          MODAL_TOKEN_SECRET: ${{ secrets.MODAL_TOKEN_SECRET }}
+          MODAL_ENVIRONMENT: ${{ vars.MODAL_ENVIRONMENT }}
+          ENTRYPOINT: ${{ vars.MODAL_ENTRYPOINT }}
+        run: |
+          set -euo pipefail
+          : "${MODAL_TOKEN_ID:?MODAL_TOKEN_ID is not set on the production environment}"
+          : "${MODAL_TOKEN_SECRET:?MODAL_TOKEN_SECRET is not set on the production environment}"
+
+          TARGET="${ENTRYPOINT:-app.py}"
+          if [ ! -f "$TARGET" ]; then
+            echo "::error::Entrypoint '$TARGET' not found. Set the MODAL_ENTRYPOINT repository variable to the app file."
+            exit 1
+          fi
+
+          # MODAL_ENVIRONMENT (when set) selects the Modal environment; unset
+          # means Modal's default environment.
+          modal deploy "$TARGET"
+
+      - name: Smoke test
+        # A deploy that "succeeded" but serves nothing is still an outage. The
+        # health URL is a repository variable; when it is empty this step is
+        # skipped rather than pretending to have verified anything.
+        if: vars.WORKER_HEALTH_URL != ''
+        env:
+          HEALTH_URL: ${{ vars.WORKER_HEALTH_URL }}
+        run: |
+          set -euo pipefail
+          for attempt in $(seq 1 12); do
+            code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 10 "$HEALTH_URL" || true)
+            if [ "$code" = "200" ]; then
+              echo "✅ Health check passed (HTTP 200) after $attempt attempt(s)."
+              exit 0
+            fi
+            echo "attempt $attempt/12: HTTP ${code:-no-response}"
+            sleep 10
+          done
+          echo "::error::Worker health check failed at $HEALTH_URL after deploy. Roll back with 'modal deploy' of the previous revision if this persists."
+          exit 1
+
+      - name: Report deployed revision
+        if: always()
+        env:
+          SHA: ${{ github.sha }}
+          IMAGE_DIGEST: ${{ needs.build-image.outputs.digest }}
+        run: |
+          {
+            echo "### Deployment"
+            echo ""
+            echo "- Commit: \`$SHA\`"
+            echo "- Image digest: \`${IMAGE_DIGEST:-n/a}\`"
+            echo "- Result: ${{ job.status }}"
+          } >> "$GITHUB_STEP_SUMMARY"
