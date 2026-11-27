@@ -1,0 +1,214 @@
+# PR Checks — the hygiene gate: naming, reviewability, and change discipline.
+#
+# These are cheap, fast checks that keep `main` linear and legible. They are
+# intentionally separate from CI so a naming slip does not read as a test
+# failure in the check rollup.
+#
+# `main` enforces `required_linear_history`, so a squash-merged PR's title
+# becomes the commit message on `main`. That is why the conventional-commit
+# title check matters here beyond cosmetics: it is what keeps `git log` on main
+# machine-readable and release-tool friendly.
+name: PR Checks
+
+on:
+  pull_request:
+    types: [opened, edited, synchronize, reopened, labeled, unlabeled, ready_for_review]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: pr-checks-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  branch-name:
+    name: Branch name
+    # Dependabot/Renovate choose their own branch names; exempt them rather
+    # than force a rename that the bot will fight on the next update.
+    if: |
+      github.actor != 'dependabot[bot]' &&
+      !startsWith(github.head_ref, 'dependabot/') &&
+      !startsWith(github.head_ref, 'renovate/')
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    steps:
+      - name: Check branch name
+        env:
+          BRANCH: ${{ github.head_ref }}
+        run: |
+          set -euo pipefail
+
+          # Two accepted shapes:
+          #   OP-123-feature-gpu-queue-drain   (ticket-backed work)
+          #   ci/harden-deploy-step            (unticketed infrastructure work)
+          TICKETED='^OP-[0-9]+-(feature|bug|task)-[a-z0-9._-]+$'
+          UNTICKETED='^(feature|bug|fix|chore|ci|docs|build|test|refactor|perf)/[a-z0-9._-]+$'
+
+          if [[ "$BRANCH" =~ $TICKETED || "$BRANCH" =~ $UNTICKETED ]]; then
+            echo "✅ Branch name is valid: '$BRANCH'"
+            exit 0
+          fi
+
+          echo "❌ Invalid branch name: '$BRANCH'"
+          echo ""
+          echo "Accepted shapes:"
+          echo "  OP-123-feature-short-description   (ticket-backed)"
+          echo "  ci/short-description               (unticketed infra work)"
+          echo ""
+          echo "Lowercase, hyphens/underscores/dots only, no spaces."
+          exit 1
+
+  pr-title:
+    name: PR title (conventional commits)
+    if: github.actor != 'dependabot[bot]'
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    steps:
+      - name: Check PR title
+        env:
+          TITLE: ${{ github.event.pull_request.title }}
+        run: |
+          set -euo pipefail
+
+          TYPES='feat|fix|chore|docs|style|refactor|perf|test|build|ci|revert'
+          # <type>(<optional scope>): [OP-123 ]<summary>
+          # The ticket is optional: not every change closes a ticket, but every
+          # change must be conventional so the squash commit on main is.
+          PATTERN="^($TYPES)(\([a-z0-9._-]+\))?: (OP-[0-9]+ )?[^ ].*$"
+
+          if [[ "$TITLE" =~ $PATTERN ]]; then
+            echo "✅ PR title is valid: '$TITLE'"
+            exit 0
+          fi
+
+          echo "❌ Invalid PR title: '$TITLE'"
+          echo ""
+          echo "Expected: <type>[(scope)]: [OP-123 ]<summary>"
+          echo "  feat(worker): OP-12 drain the queue on SIGTERM"
+          echo "  ci: pin actions to commit SHAs"
+          echo ""
+          echo "Conventional types: $TYPES"
+          exit 1
+
+  pr-size:
+    name: PR size
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Check diff size
+        env:
+          BASE_REF: ${{ github.base_ref }}
+          LABELS: ${{ join(github.event.pull_request.labels.*.name, ',') }}
+        run: |
+          set -euo pipefail
+
+          git fetch --no-tags origin "$BASE_REF"
+          STAT=$(git diff --numstat "origin/$BASE_REF...HEAD")
+          ADDED=$(printf '%s\n' "$STAT" | awk '{a+=$1} END {print a+0}')
+
+          if [[ ",$LABELS," == *",large-pr,"* ]]; then
+            echo "✅ $ADDED lines added — 'large-pr' label present, size gate waived."
+            exit 0
+          fi
+
+          if [[ "$ADDED" -gt 1000 ]]; then
+            echo "❌ PR adds $ADDED lines (limit 1000)."
+            echo "   Split it, or add the 'large-pr' label if the size is unavoidable"
+            echo "   (generated code, lockfiles, vendored data)."
+            exit 1
+          fi
+
+          if [[ "$ADDED" -gt 400 ]]; then
+            echo "::warning::$ADDED lines added — large for review. Consider splitting."
+          else
+            echo "✅ PR size is acceptable ($ADDED lines added)."
+          fi
+
+  lockfile:
+    name: Lockfile consistency
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: pyproject.toml and uv.lock must move together
+        env:
+          BASE_REF: ${{ github.base_ref }}
+        run: |
+          set -euo pipefail
+
+          # Nothing to enforce until the project exists.
+          if [ ! -f uv.lock ]; then
+            echo "::notice::No uv.lock yet — skipping lockfile consistency check."
+            exit 0
+          fi
+
+          git fetch --no-tags origin "$BASE_REF"
+          CHANGED=$(git diff --name-only "origin/$BASE_REF...HEAD")
+
+          PYPROJECT=0; LOCK=0
+          grep -qx 'pyproject.toml' <<<"$CHANGED" && PYPROJECT=1
+          grep -qx 'uv.lock' <<<"$CHANGED" && LOCK=1
+
+          if [[ "$PYPROJECT" -eq 1 && "$LOCK" -eq 0 ]]; then
+            echo "❌ pyproject.toml changed but uv.lock did not."
+            echo "   Run 'uv lock' and commit the resulting uv.lock."
+            echo "   CI installs with 'uv sync --frozen', so a stale lock fails the build anyway."
+            exit 1
+          fi
+
+          echo "✅ Lockfile state is consistent."
+        shell: bash
+
+  env-docs:
+    name: Env var documentation
+    # Only meaningful when the env contract actually changed. Job-level `if`
+    # cannot see a diff, so the check runs and exits early instead.
+    if: github.actor != 'dependabot[bot]'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Require env changes to be documented in the PR body
+        env:
+          BASE_REF: ${{ github.base_ref }}
+          PR_BODY: ${{ github.event.pull_request.body }}
+        run: |
+          set -euo pipefail
+
+          git fetch --no-tags origin "$BASE_REF"
+          ENV_DIFF=$(git diff "origin/$BASE_REF...HEAD" -- '.env.example' '.env.sample')
+
+          if [ -z "$ENV_DIFF" ]; then
+            echo "✅ No .env.example/.env.sample changes — nothing to document."
+            exit 0
+          fi
+
+          echo "⚠️  Env template changed:"
+          printf '%s\n' "$ENV_DIFF"
+
+          if ! grep -qi 'Environment Variables' <<<"${PR_BODY:-}"; then
+            echo ""
+            echo "❌ .env.example changed but the PR body has no 'Environment Variables' section."
+            echo "   Document added/changed/removed variables there — GPU hosts are configured"
+            echo "   from these templates, and an undocumented variable is an outage."
+            exit 1
+          fi
+
+          echo "✅ Env variable changes are documented in the PR body."

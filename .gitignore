@@ -1,0 +1,28 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.python-version
+
+# Tooling caches
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+.coverage.*
+coverage.xml
+htmlcov/
+
+# Secrets and per-host configuration — never commit these.
+.env
+.env.*
+!.env.example
+!.env.sample
+
+# Local GPU/vendor artifacts
+*.pt
+*.pth
+*.safetensors
+*.onnx
