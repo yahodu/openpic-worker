@@ -35,10 +35,12 @@ apply to docs, workflows and config as well as to Python.
   fail_under`, so the policy is next to the code rather than in YAML.
 - **pip-audit** for advisories, split into a blocking runtime audit and a
   non-blocking dev-toolchain audit.
-- **gitleaks CLI**, installed from a pinned release and verified against its
-  published SHA-256. The `gitleaks-action` is not used: it refuses to run for
-  organisation-owned repositories without a paid licence, and pinning the
-  binary by digest is the stronger guarantee anyway.
+- **gitleaks-action**, with the engine pinned through `GITLEAKS_VERSION` (the
+  action downloads the binary itself, so pinning only the action SHA would
+  leave the scanner floating). It needs `GITLEAKS_LICENSE` because `yahodu` is
+  an organisation; the free licence is provisioned as a repository secret. In
+  exchange it annotates the offending line in the PR, writes a job summary and
+  emits a SARIF artifact — none of which the bare CLI does.
 
 ## Two settings that live outside the repo
 
